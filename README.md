@@ -97,6 +97,104 @@ heap allocations) is the primary cause. This informs the focus of the upcoming p
 
 ---
 
+### Phase 1 — Profiling and AVX-512 fmadd Optimization
+
+#### Profiling
+
+Three tools were used to locate the bottleneck:
+
+**`perf stat` (query path only)**
+
+```
+IPC:              1.19    (CPU stalling on memory — below compute saturation)
+L1-miss rate:     6.79%
+LLC-miss rate:    19.82%  (nearly 1 in 5 cache accesses goes to RAM)
+Branch-miss rate: 1.57%   (priority queue heap comparisons unpredictable)
+```
+
+**`perf record -g`** (call-graph sampling)
+
+`L2SqrSIMD16ExtAVX512` accounted for **47.55% self-time** — the single hottest function. The profile was dominated by the index build (180 s vs 0.56 s for queries), which is why `--query` mode was added to `bench.cpp` for clean query-path measurements.
+
+**Assembly inspection + vectorization report**
+
+`objdump` confirmed AVX-512 is active (`zmm` registers). The GCC vectorization report (`-fopt-info-vec`) revealed that the AVX-512 hot loop was emitting two separate instructions (`vmulps` + `vaddps`) where a single fused multiply-add was available.
+
+#### Optimization: fmadd in `L2SqrSIMD16ExtAVX512`
+
+`hnswlib/space_l2.h` — uncommented the existing `_mm512_fmadd_ps` call:
+
+```cpp
+// Before: 2 instructions
+sum = _mm512_add_ps(sum, _mm512_mul_ps(diff, diff));
+
+// After: 1 instruction
+sum = _mm512_fmadd_ps(diff, diff, sum);
+```
+
+`_mm512_fmadd_ps` computes `diff * diff + sum` as a single fused operation — lower latency and higher throughput on Zen 5's FMA units.
+
+#### Results
+
+| Metric | Baseline | Phase 1 | Delta |
+|---|---|---|---|
+| QPS | 17,677.7 | **18,547.9** | **+4.9%** |
+| Recall@10 | 0.9465 | 0.9465 | 0 |
+| IPC | 1.19 | 1.24 | +4.2% |
+| LLC-miss rate | 19.82% | 18.99% | −0.4pp |
+| Branch-miss rate | 1.57% | 1.56% | ~0 |
+
+IPC increase confirms fewer instructions per loop iteration. Memory and branch counters are flat — as expected for a compute-side change with no effect on access patterns.
+
+---
+
+### Phase 2 — Memory Layout Optimizations
+
+Two structural memory problems were identified from Phase 1 profiling and addressed together.
+
+#### Problem 1: Scattered upper-layer neighbor lists
+
+The original code called `malloc` once per node during `addPoint`, scattering ~62,500 independent allocations randomly across the heap. Every `get_linklist` call during graph traversal dereferenced a pointer to a random address, causing TLB misses and poor cache locality.
+
+**Fix — arena allocator:** a single contiguous block is pre-allocated upfront. Every node's upper-layer neighbor list lives at a fixed, predictable offset:
+
+```cpp
+linklists_arena_ = (char *) malloc(max_elements_ * linklists_slot_size_);
+linkLists_[i] = linklists_arena_ + i * linklists_slot_size_;  // node i's slot
+```
+
+This eliminates ~62,500 `malloc`/`free` calls during build and consolidates all neighbor data into one memory region. The kernel automatically backed this large contiguous allocation with 2 MB huge pages, collapsing dTLB misses from **3.65 billion → ~13 million** (270×).
+
+#### Problem 2: Misaligned vector data
+
+Each node's 128-float vector started at byte offset 132 within its slot. Since 132 % 64 = 4, every AVX-512 load of 16 floats (64 bytes) crossed a cache line boundary, requiring two cache line fetches where one should suffice.
+
+**Fix — vector-first layout + `aligned_alloc`:** the slot was reordered so the vector occupies offset 0, and the slot size padded to a multiple of 64:
+
+```
+Before: [ neighbor list: 132 B | vector: 512 B | label: 8 B ]  = 652 B (misaligned)
+After:  [ vector: 512 B | neighbor list: 132 B | label: 8 B | padding: 52 B ] = 704 B (aligned)
+```
+
+With `aligned_alloc(64, ...)` for the base pointer and a slot size of 704 (= 11 × 64), every node's vector is guaranteed 64-byte aligned — eliminating all cache line splits in the AVX-512 distance loop.
+
+`realloc` does not preserve alignment, so `resizeIndex` was updated to use `aligned_alloc + memcpy + free`.
+
+#### Results
+
+| Metric | Baseline | Phase 1 | Phase 2 | Delta vs baseline |
+|---|---|---|---|---|
+| QPS | 17,677.7 | 18,547.9 | **19,624.8** | **+11.0%** |
+| Recall@10 | 0.9465 | 0.9465 | 0.9465 | 0 |
+| IPC | 1.19 | 1.24 | 1.32 | +10.9% |
+| L1-miss rate | 6.79% | 6.80% | 6.58% | −0.2pp |
+| Branch-miss rate | 1.57% | 1.56% | 1.42% | −0.1pp |
+| dTLB-load-misses | ~3.65 B | — | ~13 M | −270× |
+
+LLC-miss *rate* rose from 18.99% to 22.43% despite absolute misses being flat — total LLC accesses dropped 14% (fewer wasted cache-line fetches per distance call), which raises the ratio while the underlying miss count is unchanged.
+
+---
+
 ## License
 
 Apache License 2.0 — same as the original [nmslib/hnswlib](https://github.com/nmslib/hnswlib).
