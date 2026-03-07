@@ -49,6 +49,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     char *data_level0_memory_{nullptr};
     char **linkLists_{nullptr};
+    char *linklists_arena_{nullptr};  // contiguous block for all upper-layer neighbor lists (replaces per-node mallocs)
+    size_t linklists_slot_size_{0};   // bytes per node in the arena
+    int max_level_bound_{0};          // estimated max HNSW level; used to size each arena slot
     std::vector<int> element_levels_;  // keeps level of each element
 
     size_t data_size_{0};
@@ -118,12 +121,17 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         update_probability_generator_.seed(random_seed + 1);
 
         size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
-        size_data_per_element_ = size_links_level0_ + data_size_ + sizeof(labeltype);
-        offsetData_ = size_links_level0_;
-        label_offset_ = size_links_level0_ + data_size_;
-        offsetLevel0_ = 0;
 
-        data_level0_memory_ = (char *) malloc(max_elements_ * size_data_per_element_);
+        // Slot layout per node: [ vector | neighbor list | label | padding ]
+        // Vector is first so it sits at offset 0 — no padding needed before it.
+        // With a 64-byte aligned base and slot size rounded to a multiple of 64,
+        // every node's vector is 64-byte aligned (one clean cache line for AVX-512).
+        offsetData_  = 0;
+        offsetLevel0_ = data_size_;
+        label_offset_ = data_size_ + size_links_level0_;
+        size_data_per_element_ = (label_offset_ + sizeof(labeltype) + 63) & ~size_t(63); // round to multiple of 64
+
+        data_level0_memory_ = (char *) aligned_alloc(64, max_elements_ * size_data_per_element_);
         if (data_level0_memory_ == nullptr)
             throw std::runtime_error("Not enough memory");
 
@@ -141,6 +149,21 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
         mult_ = 1 / log(1.0 * M_);
         revSize_ = 1.0 / mult_;
+
+        // Arena for upper-layer neighbor lists: one allocation instead of one malloc per node.
+        // Node i's neighbors live at linklists_arena_ + i * linklists_slot_size_ (predictable stride).
+        max_level_bound_ = (int)(log((double)max_elements_) * mult_) + 2;
+        if (max_level_bound_ < 1) max_level_bound_ = 1;
+
+        linklists_slot_size_ = size_links_per_element_ * max_level_bound_;
+        linklists_arena_ = (char *) malloc(max_elements_ * linklists_slot_size_);
+
+        if (linklists_arena_ == nullptr)
+            throw std::runtime_error("Not enough memory: HierarchicalNSW failed to allocate linklists arena");
+        memset(linklists_arena_, 0, max_elements_ * linklists_slot_size_);
+
+        for (size_t i = 0; i < max_elements_; i++)
+            linkLists_[i] = linklists_arena_ + i * linklists_slot_size_;
     }
 
 
@@ -151,10 +174,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     void clear() {
         free(data_level0_memory_);
         data_level0_memory_ = nullptr;
-        for (tableint i = 0; i < cur_element_count; i++) {
-            if (element_levels_[i] > 0)
-                free(linkLists_[i]);
-        }
+        free(linklists_arena_);
+        linklists_arena_ = nullptr;
         free(linkLists_);
         linkLists_ = nullptr;
         cur_element_count = 0;
@@ -640,10 +661,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         std::vector<std::mutex>(new_max_elements).swap(link_list_locks_);
 
-        // Reallocate base layer
-        char * data_level0_memory_new = (char *) realloc(data_level0_memory_, new_max_elements * size_data_per_element_);
+        // aligned_alloc can't be grown with realloc (alignment not guaranteed), so malloc+memcpy+free
+        char * data_level0_memory_new = (char *) aligned_alloc(64, new_max_elements * size_data_per_element_);
         if (data_level0_memory_new == nullptr)
             throw std::runtime_error("Not enough memory: resizeIndex failed to allocate base layer");
+        memcpy(data_level0_memory_new, data_level0_memory_, cur_element_count * size_data_per_element_);
+        free(data_level0_memory_);
         data_level0_memory_ = data_level0_memory_new;
 
         // Reallocate all other layers
@@ -651,6 +674,19 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         if (linkLists_new == nullptr)
             throw std::runtime_error("Not enough memory: resizeIndex failed to allocate other layers");
         linkLists_ = linkLists_new;
+
+        // Extend arena: copy existing data into a new larger block, zero the new slots
+        char *arena_new = (char *) malloc(new_max_elements * linklists_slot_size_);
+        if (arena_new == nullptr)
+            throw std::runtime_error("Not enough memory: resizeIndex failed to allocate linklists arena");
+
+        memcpy(arena_new, linklists_arena_, max_elements_ * linklists_slot_size_);
+        memset(arena_new + max_elements_ * linklists_slot_size_, 0, (new_max_elements - max_elements_) * linklists_slot_size_);
+        free(linklists_arena_);
+        linklists_arena_ = arena_new;
+
+        for (size_t i = 0; i < new_max_elements; i++)
+            linkLists_[i] = linklists_arena_ + i * linklists_slot_size_;
 
         max_elements_ = new_max_elements;
     }
@@ -774,7 +810,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         input.seekg(pos, input.beg);
 
-        data_level0_memory_ = (char *) malloc(max_elements * size_data_per_element_);
+        data_level0_memory_ = (char *) aligned_alloc(64, max_elements * size_data_per_element_);
         if (data_level0_memory_ == nullptr)
             throw std::runtime_error("Not enough memory: loadIndex failed to allocate level0");
         input.read(data_level0_memory_, cur_element_count * size_data_per_element_);
@@ -793,18 +829,27 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         element_levels_ = std::vector<int>(max_elements);
         revSize_ = 1.0 / mult_;
         ef_ = 10;
+
+        max_level_bound_ = (int)(log((double)max_elements_) * mult_) + 2; // +2 just to be sure, because the formula can be a bit off due to rounding
+        if (max_level_bound_ < 1) max_level_bound_ = 1;
+        linklists_slot_size_ = size_links_per_element_ * max_level_bound_; //how many bytes the neighbor list of one element on all layers can take in the worst case
+        linklists_arena_ = (char *) malloc(max_elements_ * linklists_slot_size_); // one allocation for all upper layers to reduce fragmentation and improve cache performance
+
+        if (linklists_arena_ == nullptr)
+            throw std::runtime_error("Not enough memory: loadIndex failed to allocate linklists arena");
+        memset(linklists_arena_, 0, max_elements_ * linklists_slot_size_); //0 the arena, each neighbour lists starts with 0 neighbours, else would be garbage
+
+        for (size_t i = 0; i < max_elements_; i++)
+            linkLists_[i] = linklists_arena_ + i * linklists_slot_size_; // assign the slots for each node
+
         for (size_t i = 0; i < cur_element_count; i++) {
             label_lookup_[getExternalLabel(i)] = i;
             unsigned int linkListSize;
             readBinaryPOD(input, linkListSize);
             if (linkListSize == 0) {
                 element_levels_[i] = 0;
-                linkLists_[i] = nullptr;
             } else {
                 element_levels_[i] = linkListSize / size_links_per_element_;
-                linkLists_[i] = (char *) malloc(linkListSize);
-                if (linkLists_[i] == nullptr)
-                    throw std::runtime_error("Not enough memory: loadIndex failed to allocate linklist");
                 input.read(linkLists_[i], linkListSize);
             }
         }
@@ -1197,17 +1242,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         tableint currObj = enterpoint_node_;
         tableint enterpoint_copy = enterpoint_node_;
 
-        memset(data_level0_memory_ + cur_c * size_data_per_element_ + offsetLevel0_, 0, size_data_per_element_);
+        memset(data_level0_memory_ + cur_c * size_data_per_element_ + offsetLevel0_, 0, size_links_level0_);
 
         // Initialisation of the data and label
         memcpy(getExternalLabeLp(cur_c), &label, sizeof(labeltype));
         memcpy(getDataByInternalId(cur_c), data_point, data_size_);
 
         if (curlevel) {
-            linkLists_[cur_c] = (char *) malloc(size_links_per_element_ * curlevel + 1);
-            if (linkLists_[cur_c] == nullptr)
-                throw std::runtime_error("Not enough memory: addPoint failed to allocate linklist");
-            memset(linkLists_[cur_c], 0, size_links_per_element_ * curlevel + 1);
+            // slot is pre-allocated in the arena; just zero the levels this node will use
+            memset(linkLists_[cur_c], 0, size_links_per_element_ * curlevel);
         }
 
         if ((signed)currObj != -1) {
