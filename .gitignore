@@ -13,3 +13,6 @@ var/
 *.pyc
 bench
 datasets/
+perf.data
+perf.data.old
+cachegrind.out.*
