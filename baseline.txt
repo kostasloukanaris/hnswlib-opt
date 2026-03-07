@@ -1,0 +1,23 @@
+Phase 0 Baseline — Frozen Reference
+=====================================
+Date:     2026-03-07
+Machine:  AMD Ryzen 7 9700X
+Build:    g++ -Ofast -march=native -mavx2 -mavx512f -mavx512dq -mfma
+Dataset:  SIFT1M (1,000,000 vectors, 128-dim float32)
+Index:    M=16, ef_construction=200, ef_search=50, k=10
+
+Run Results
+-----------
+Run 1:  QPS = 17631.9   Recall@10 = 0.9465   Time = 0.567s
+Run 2:  QPS = 17747.6   Recall@10 = 0.9465   Time = 0.563s
+Run 3:  QPS = 17578.7   Recall@10 = 0.9465   Time = 0.569s
+Run 4:  QPS = 17752.4   Recall@10 = 0.9465   Time = 0.563s
+
+Summary
+-------
+Mean QPS:     17677.7
+Min QPS:      17578.7
+Max QPS:      17752.4
+QPS Variance: 0.98%   (PASS -- threshold: <2%)
+Recall@10:    0.9465  (stable across all runs)
+

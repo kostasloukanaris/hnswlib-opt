@@ -83,7 +83,7 @@ static bool AVXCapable() {
         uint64_t xcrFeatureMask = xgetbv(_XCR_XFEATURE_ENABLED_MASK);
         avxSupported = (xcrFeatureMask & 0x6) == 0x6;
     }
-    return HW_AVX && avxSupported;
+    return HW_AVX && avxSupported; //hardware and os avx support
 }
 
 static bool AVX512Capable() {
