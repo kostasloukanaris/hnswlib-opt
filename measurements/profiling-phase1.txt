@@ -1,0 +1,131 @@
+Phase 1 — Profiling Results
+===========================
+
+Step 1 — perf stat
+------------------
+Command:
+  perf stat -e cycles,instructions,cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses,branch-instructions,branch-misses,dTLB-load-misses ./build/bench_release
+
+Raw output:
+  cycles:                1,011,802,558,201
+  instructions:            891,932,180,908   (0.88 insn per cycle)
+  cache-references:        183,653,796,638
+  cache-misses:             35,801,942,834   (19.49% of all cache refs)
+  L1-dcache-loads:         549,271,706,820
+  L1-dcache-load-misses:    56,870,639,130   (10.35% of all L1-dcache accesses)
+  LLC-loads:                   not supported (AMD PMU requires raw event codes)
+  LLC-load-misses:             not supported
+  branch-instructions:      99,246,519,873
+  branch-misses:             4,549,475,964   (4.58% of all branches)
+  dTLB-load-misses:          3,654,532,551
+
+Derived metrics:
+  IPC (manual):  891,932,180,908 / 1,011,802,558,201 = 0.881
+
+Analysis:
+  IPC 0.88          — below 1.0, CPU is memory-bound, stalling waiting for data
+  Cache-miss 19.49% — nearly 1 in 5 cache accesses goes to RAM
+  L1-miss 10.35%    — 1 in 10 L1 loads misses, data not in fastest cache
+  Branch-miss 4.58% — 4.5B wrong predictions, search conditionals are unpredictable
+  dTLB-misses 3.65B — address translation fails constantly, scattered memory layout
+
+Conclusion:
+  The HNSW graph nodes are allocated separately via malloc throughout the heap.
+  Every neighbor pointer follow in searchBaseLayerST jumps to a random memory
+  location — guaranteed L1 miss, likely LLC miss, dTLB miss. The CPU cannot
+  prefetch because the next address is unknown until the current one resolves.
+  This is classic pointer-chasing latency. The bottleneck is memory, not compute.
+
+Step 2 — Call-graph profiling (perf record -g)
+----------------------------------------------
+Command:
+  perf record -g ./build/bench_release
+  perf report --stdio | head -40
+
+Samples: 635,429 of event 'cycles:P'
+Note: profile is dominated by index build (~180s) not queries (~0.56s).
+      The query hot path (searchBaseLayerST) is underrepresented here.
+
+Top functions by Self% (cycles spent inside the function itself):
+  47.55%  L2SqrSIMD16ExtAVX512          -- distance computation (confirmed hottest)
+   0.73%  addPoint                       -- insertion orchestration
+   rest    in children / call overhead
+
+Top functions by Children% (cycles including all callees):
+  88.45%  addPoint                       -- entire index build
+  71.90%  L2SqrSIMD16ExtAVX512          -- called from both build and search
+
+Call tree breakdown inside addPoint:
+  48.21% -> L2SqrSIMD16ExtAVX512        -- distance calls during index build
+  37.06% -> searchBaseLayer             -- neighbor search during index build
+   1.78% -> pthread_mutex_lock          -- locking overhead during concurrent insert
+
+Key findings:
+  1. AVX-512 distance function is already active and is the single hottest function.
+  2. Mutex locking contributes 1.78% -- visible but not the primary bottleneck.
+  3. Query path is not visible here because build time dwarfs query time 320:1.
+     To profile queries specifically, the index must be saved and reloaded to skip build.
+
+
+Step 3 — Assembly inspection + vectorization report
+---------------------------------------------------
+Commands:
+  g++ -O3 -march=native -mavx512f -mfma -fopt-info-vec-optimized -fopt-info-vec-missed
+      -std=c++17 -I. -o /tmp/bench_veccheck bench.cpp 2>&1 | grep -E "space_l2|space_ip|hnswalg"
+  objdump -d ./build/bench_release | grep -A 20 "L2SqrSIMD16Ext" | head -40
+  objdump -d ./build/bench_release | grep -E "zmm|ymm|xmm|movss|addss" | head -20
+
+--- Vectorization report ---
+
+Optimized (compiler auto-vectorized):
+  space_l2.h:13  L2Sqr scalar loop -- vectorized to 64-byte (AVX-512) AND 32-byte (AVX2)
+                 Even the fallback path is fast.
+
+Missed -- expected (manual intrinsics, compiler correctly skips):
+  space_l2.h:38   L2SqrSIMD16ExtAVX512 while loop -- already uses zmm intrinsics
+  space_l2.h:73   L2SqrSIMD16ExtAVX while loop    -- already uses ymm intrinsics
+  space_l2.h:110  L2SqrSIMD16ExtSSE while loop    -- already uses xmm intrinsics
+  space_l2.h:180  L2SqrSIMD4Ext while loop        -- already uses xmm intrinsics
+
+Missed -- function pointer blocks optimization:
+  space_l2.h:153  L2SqrSIMD16ExtResiduals calls L2SqrSIMD16Ext through a function pointer.
+                  Compiler cannot inline or see the callee -- residual wrapper loses
+                  optimization opportunities.
+
+Missed -- not on hot path:
+  hnswalg.h:154   clear() destructor loop -- free() calls prevent vectorization
+  hnswalg.h:685+  saveIndex file I/O -- exceptions prevent vectorization
+
+Missed -- worth noting:
+  hnswalg.h:247   getNeighborsByHeuristic2 -- "loop nest containing two or more
+                  consecutive inner loops cannot be vectorized"
+                  This runs on every insertion and during updates.
+
+--- Assembly inspection ---
+
+Result: AVX-512 confirmed active (zmm registers present).
+
+Hot loop body of L2SqrSIMD16ExtAVX512 (one iteration = 16 floats):
+  vmovups (%rdi),%zmm0      ; load 16 floats (64 bytes) from vector1
+  vmovups (%rsi),%zmm2      ; load 16 floats from vector2
+  add $0x40,%rdi            ; advance pointer 64 bytes (16 floats)
+  add $0x40,%rsi
+  vsubps %zmm2,%zmm0,%zmm0  ; diff = v1 - v2  (16 subtractions in 1 instruction)
+  vmulps %zmm0,%zmm0,%zmm0  ; diff * diff      (16 multiplications in 1 instruction)
+  vaddps %zmm0,%zmm1,%zmm1  ; sum += diff^2    (16 additions in 1 instruction)
+  jb loop
+
+After loop: horizontal reduction collapses zmm1 (16 floats) to 1 scalar using
+  vshufps, vextractf32x4, vextractf32x8, valignd, vaddss.
+
+Register summary:
+  zmm (512-bit, 16 floats) -- main loop          CONFIRMED AVX-512
+  ymm (256-bit,  8 floats) -- horizontal reduction steps
+  xmm (128-bit,  4 floats) -- final scalar accumulation
+  addss / movss            -- scalar, only in horizontal reduction (expected, not a problem)
+
+Missed optimization spotted:
+  Source has vmulps + vaddps as two separate instructions.
+  space_l2.h:44 has fmadd commented out:
+    // sum = _mm512_fmadd_ps(diff, diff, sum);
+  Uncommenting would fuse multiply+add into 1 instruction -- faster and more precise, fixed.
