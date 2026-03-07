@@ -103,3 +103,10 @@ if(HNSWLIB_EXAMPLES)
     add_executable(main tests/cpp/main.cpp tests/cpp/sift_1b.cpp)
     target_link_libraries(main hnswlib)
 endif()
+
+# Benchmark targets (phase 0 baseline)
+add_executable(bench_release bench.cpp)
+target_link_libraries(bench_release hnswlib)
+
+add_executable(bench_debug bench.cpp)
+target_link_libraries(bench_debug hnswlib)
